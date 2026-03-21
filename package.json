@@ -1,0 +1,36 @@
+{
+  "name": "payslip-mailer",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node node_modules/@tauri-apps/cli/tauri.js dev",
+    "build:web": "vite build",
+    "build": "node node_modules/@tauri-apps/cli/tauri.js build",
+    "check:macos:signing": "./scripts/check-macos-signing.sh",
+    "build:macos:app": "./scripts/build-macos.sh arm64 app",
+    "build:macos:dmg": "./scripts/build-macos.sh arm64 dmg",
+    "build:macos:app:arm64": "./scripts/build-macos.sh arm64 app",
+    "build:macos:dmg:arm64": "./scripts/build-macos.sh arm64 dmg",
+    "build:macos:app:x64": "./scripts/build-macos.sh x64 app",
+    "build:macos:dmg:x64": "./scripts/build-macos.sh x64 dmg",
+    "build:windows:msi": "./scripts/build-windows.sh x64 msi",
+    "build:release": "./scripts/build-release.sh all",
+    "notarize:macos:dmg": "./scripts/notarize-dmg.sh",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.4.0",
+    "@tauri-apps/cli": "^2.4.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.0.0"
+  }
+}

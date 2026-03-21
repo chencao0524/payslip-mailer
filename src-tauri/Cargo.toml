@@ -1,0 +1,17 @@
+[package]
+name = "payslip_mailer"
+version = "0.1.0"
+authors = ["payslip-mailer"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+tauri = { version = "2.10.1", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "hostname", "native-tls"] }
+regex = "1.12.2"
+v_htmlescape = "0.15.8"
