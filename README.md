@@ -51,3 +51,10 @@ This repository contains the desktop-only 工资条发送器 tool. It can be run
 ## Notes
 - The app writes history to the standard config directory via `tauri::api::path::app_config_dir` and keeps the UI self-contained.
 - You can tweak the recipient list, subject, and note fields before hitting the send button; the frontend simply passes them through to Rust for logging.
+
+## 截图
+<img width="283" height="222" alt="图片" src="https://github.com/user-attachments/assets/d743c3a5-a642-4b83-8640-5ff40c77cb57" />
+
+模版：[工资条模版.xlsx](https://github.com/user-attachments/files/26165805/default.xlsx)
+
+
