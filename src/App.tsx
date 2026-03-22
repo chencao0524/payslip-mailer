@@ -398,15 +398,6 @@ function App() {
                 </div>
               </div>
 
-              <div className="chips">
-                {preview.headers
-                  .filter(Boolean)
-                  .slice(0, 18)
-                  .map((header) => (
-                    <span key={header} className="chip">{`{{${header}}}`}</span>
-                  ))}
-              </div>
-
               <div className="table-shell">
                 <table>
                   <thead>
