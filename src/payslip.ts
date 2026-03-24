@@ -22,6 +22,7 @@ export type PreviewResponse = {
   readyCount: number;
   invalidCount: number;
   skippedCount: number;
+  duplicateEmailMessages: string[];
   defaultSubjectTemplate: string;
   defaultBodyTemplate: string;
 };
@@ -248,6 +249,8 @@ function buildPreviewResponse(fileName: string, sheetName: string, rawRows: (str
     rows.push(toPreviewRow(rowIndex + 1, values));
   }
 
+  const duplicateEmailMessages = markDuplicateEmails(rows);
+
   const readyCount = rows.filter((row) => row.status === "READY").length;
   const invalidCount = rows.filter((row) => row.status === "INVALID").length;
   const skippedCount = rows.filter((row) => row.status === "SKIPPED").length;
@@ -261,6 +264,7 @@ function buildPreviewResponse(fileName: string, sheetName: string, rawRows: (str
     readyCount,
     invalidCount,
     skippedCount,
+    duplicateEmailMessages,
     defaultSubjectTemplate: DEFAULT_SUBJECT_TEMPLATE,
     defaultBodyTemplate: buildDefaultBodyTemplate(),
   } satisfies PreviewResponse;
@@ -322,8 +326,51 @@ function toPreviewRow(rowNumber: number, values: Record<string, string>): Previe
   return { rowNumber, recipientName, email, month, netPay, status: "READY", message: "校验通过，可发送", values };
 }
 
+function markDuplicateEmails(rows: PreviewRow[]) {
+  const emailMap = new Map<string, PreviewRow[]>();
+
+  rows.forEach((row) => {
+    const normalizedEmail = normalizeEmail(row.email);
+    if (!normalizedEmail) {
+      return;
+    }
+    const group = emailMap.get(normalizedEmail);
+    if (group) {
+      group.push(row);
+      return;
+    }
+    emailMap.set(normalizedEmail, [row]);
+  });
+
+  const duplicates = Array.from(emailMap.entries())
+    .filter(([, group]) => group.length > 1)
+    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
+
+  duplicates.forEach(([, group]) => {
+    group.forEach((row) => {
+      row.status = "INVALID";
+      row.message = "邮箱重复，已禁止发送，请先修正导入文件";
+    });
+  });
+
+  return duplicates.map(([email, group]) => {
+    const rowNumbers = group.map((row) => row.rowNumber).join("、");
+    const names = group
+      .map((row) => row.recipientName)
+      .filter(Boolean)
+      .join(" / ");
+    return names
+      ? `${email}（第 ${rowNumbers} 行，${names}）`
+      : `${email}（第 ${rowNumbers} 行）`;
+  });
+}
+
 function valueOf(values: Record<string, string>, key: string) {
   return normalizeText(values[key] ?? "");
+}
+
+function normalizeEmail(value: string) {
+  return normalizeText(value).toLowerCase();
 }
 
 function normalizeText(value: string) {

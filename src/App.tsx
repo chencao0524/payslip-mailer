@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   buildDefaultBodyTemplate,
   DEFAULT_SMTP,
@@ -11,7 +12,12 @@ import {
   type SendResponse,
   type SmtpSettings,
 } from "./payslip";
-import { loadSettings, saveSettings, sendPayslips } from "./runtime";
+import {
+  isTauriRuntime,
+  loadSettings,
+  saveSettings,
+  sendPayslips,
+} from "./runtime";
 
 const PREVIEW_STATUS_TEXT = {
   READY: "可发送",
@@ -23,6 +29,57 @@ const SEND_STATUS_TEXT = {
   SUCCESS: "发送成功",
   FAILED: "发送失败",
 } as const;
+
+type SmtpValidationErrors = Partial<
+  Record<"host" | "port" | "username" | "password" | "fromAddress", string>
+>;
+
+type SendProgressEvent = {
+  processedCount: number;
+  totalCount: number;
+  rowNumber: number;
+  recipientName: string;
+  email: string;
+  status: "SUCCESS" | "FAILED";
+};
+
+function validateSmtpSettings(smtp: SmtpSettings): SmtpValidationErrors {
+  const errors: SmtpValidationErrors = {};
+
+  if (!smtp.host.trim()) {
+    errors.host = "请输入 SMTP 主机";
+  }
+
+  const port = smtp.port.trim();
+  if (!port) {
+    errors.port = "请输入端口";
+  } else {
+    const portNumber = Number(port);
+    if (!Number.isInteger(portNumber) || portNumber <= 0 || portNumber > 65535) {
+      errors.port = "端口必须是 1 到 65535 的整数";
+    }
+  }
+
+  if (!smtp.fromAddress.trim()) {
+    errors.fromAddress = "请输入发件邮箱";
+  }
+
+  if (smtp.auth && !smtp.username.trim()) {
+    errors.username = "启用 SMTP 认证时必须填写用户名";
+  }
+
+  if (smtp.auth && !smtp.password.trim()) {
+    errors.password = "启用 SMTP 认证时必须填写密码或授权码";
+  }
+
+  return errors;
+}
+
+function waitForNextPaint() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -46,7 +103,11 @@ function App() {
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
-  const [sendProgress, setSendProgress] = useState(0);
+  const [sendProgressCount, setSendProgressCount] = useState(0);
+  const [sendProgressTotal, setSendProgressTotal] = useState(0);
+  const [sendProgressCurrentLabel, setSendProgressCurrentLabel] = useState<
+    string | null
+  >(null);
 
   useEffect(() => {
     let active = true;
@@ -78,40 +139,52 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isSending) {
-      setSendProgress(0);
+    if (!isTauriRuntime()) {
       return;
     }
 
-    setSendProgress(8);
-    const timer = window.setInterval(() => {
-      setSendProgress((current) => {
-        if (current >= 92) {
-          return current;
-        }
-        const next =
-          current < 24 ? current + 8 : current < 56 ? current + 5 : current + 3;
-        return Math.min(next, 92);
-      });
-    }, 450);
+    let unlisten: (() => void) | undefined;
+    void listen<SendProgressEvent>("payslip-send-progress", (event) => {
+      const payload = event.payload;
+      setSendProgressCount(payload.processedCount);
+      setSendProgressTotal(payload.totalCount);
+      setSendProgressCurrentLabel(
+        `${payload.recipientName || payload.email || `第 ${payload.rowNumber} 行`} ${payload.status === "SUCCESS" ? "已发送" : "发送失败"}`,
+      );
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
 
     return () => {
-      window.clearInterval(timer);
+      unlisten?.();
     };
-  }, [isSending]);
+  }, []);
 
   const sendProgressLabel = useMemo(() => {
-    if (!isSending) {
+    if (sendProgressTotal === 0) {
       return null;
     }
-    if (sendProgress < 20) {
-      return "正在连接 SMTP 服务器";
+    if (isSending) {
+      return `正在发送 ${sendProgressCount} / ${sendProgressTotal}`;
     }
-    if (sendProgress < 55) {
-      return "正在认证并建立加密连接";
+    if (sendProgressCount >= sendProgressTotal) {
+      return `发送完成 ${sendProgressCount} / ${sendProgressTotal}`;
     }
-    return "正在逐条发送工资条邮件";
-  }, [isSending, sendProgress]);
+    return `发送中断 ${sendProgressCount} / ${sendProgressTotal}`;
+  }, [isSending, sendProgressCount, sendProgressTotal]);
+
+  const sendProgressPercent = useMemo(() => {
+    if (sendProgressTotal === 0) {
+      return 0;
+    }
+    if (sendProgressTotal > 0) {
+      return Math.max(
+        6,
+        Math.min(100, Math.round((sendProgressCount / sendProgressTotal) * 100)),
+      );
+    }
+    return isSending ? 8 : 0;
+  }, [isSending, sendProgressCount, sendProgressTotal]);
 
   const readyRows = useMemo(
     () =>
@@ -125,6 +198,9 @@ function App() {
         })) ?? [],
     [preview],
   );
+
+  const hasDuplicateEmails = (preview?.duplicateEmailMessages.length ?? 0) > 0;
+  const smtpValidationErrors = useMemo(() => validateSmtpSettings(smtp), [smtp]);
 
   const failedRows = useMemo(() => {
     const invalidPreviewRows =
@@ -167,6 +243,9 @@ function App() {
     setError(null);
     setSettingsMessage(null);
     setSendResult(null);
+    setSendProgressCount(0);
+    setSendProgressTotal(0);
+    setSendProgressCurrentLabel(null);
     setIsPreviewing(true);
     try {
       const result = await parsePayslipFile(targetFile);
@@ -199,10 +278,24 @@ function App() {
       return;
     }
 
+    const validationErrors = validateSmtpSettings(smtp);
+    if (Object.keys(validationErrors).length > 0) {
+      setError(
+        `请先完善 SMTP 配置：${Object.values(validationErrors)
+          .map((message) => message.replace(/^请输入/, ""))
+          .join("、")}`,
+      );
+      return;
+    }
+
     setError(null);
     setSettingsMessage(null);
     setIsSending(true);
+    setSendProgressCount(0);
+    setSendProgressTotal(readyRows.length);
+    setSendProgressCurrentLabel("正在准备发送");
     try {
+      await waitForNextPaint();
       const request: SendRequest = {
         subjectTemplate,
         bodyTemplate,
@@ -210,7 +303,11 @@ function App() {
         rows: readyRows,
       };
       const result = await sendPayslips(request);
-      setSendProgress(100);
+      setSendProgressCount(result.totalCount);
+      setSendProgressTotal(result.totalCount);
+      setSendProgressCurrentLabel(
+        result.failureCount > 0 ? "发送完成，部分记录失败" : "发送完成",
+      );
       setSendResult(result);
     } catch (invokeError) {
       setError(
@@ -227,6 +324,16 @@ function App() {
       defaultBodyTemplate,
       smtp,
     };
+    const validationErrors = validateSmtpSettings(settings.smtp);
+    if (Object.keys(validationErrors).length > 0) {
+      setError(
+        `请先完善 SMTP 配置：${Object.values(validationErrors)
+          .map((message) => message.replace(/^请输入/, ""))
+          .join("、")}`,
+      );
+      setSettingsMessage(null);
+      return;
+    }
     setIsSavingSettings(true);
     setError(null);
     setSettingsMessage(null);
@@ -259,6 +366,9 @@ function App() {
     setSendResult(null);
     setError(null);
     setSettingsMessage(null);
+    setSendProgressCount(0);
+    setSendProgressTotal(0);
+    setSendProgressCurrentLabel(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -337,7 +447,7 @@ function App() {
               className="primary-button"
               type="button"
               onClick={handleSend}
-              disabled={isSending || readyRows.length === 0}
+              disabled={isSending || readyRows.length === 0 || hasDuplicateEmails}
             >
               {isSending ? "发送中..." : `发送 ${readyRows.length} 条`}
             </button>
@@ -359,26 +469,37 @@ function App() {
             </button>
           </div>
 
-          {isSending ? (
+          {sendProgressTotal > 0 ? (
             <div className="progress-card" aria-live="polite">
               <div className="progress-copy">
-                <strong>发送进行中</strong>
+                <strong>{isSending ? "发送进行中" : "发送进度"}</strong>
                 <span>{sendProgressLabel}</span>
               </div>
               <div className="progress-track">
                 <div
                   className="progress-fill"
-                  style={{ width: `${sendProgress}%` }}
-                />
-              </div>
-              <p className="helper-text">
-                真实 SMTP
-                发送会依次完成连接、认证和逐条投递，这段时间页面不是卡住，只是此前缺少过程反馈。
+                    style={{ width: `${sendProgressPercent}%` }}
+                  />
+                </div>
+                <p className="helper-text">
+                {sendProgressCurrentLabel ?? "真实 SMTP 发送会逐条反馈处理进度。"}
               </p>
             </div>
           ) : null}
 
           {error ? <p className="feedback error-text">{error}</p> : null}
+          {hasDuplicateEmails ? (
+            <div className="duplicate-alert" role="alert">
+              <p className="feedback error-text">
+                检测到重复邮箱，已禁止本次发送。请先修正导入文件后重新预览：
+              </p>
+              <ul className="duplicate-list">
+                {preview?.duplicateEmailMessages.map((message) => (
+                  <li key={message}>{message}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {settingsMessage ? (
             <p className="feedback success-text">{settingsMessage}</p>
           ) : null}
@@ -553,6 +674,8 @@ function App() {
               <label className="field">
                 <span>SMTP 主机</span>
                 <input
+                  aria-invalid={Boolean(smtpValidationErrors.host)}
+                  className={smtpValidationErrors.host ? "input-error" : undefined}
                   value={smtp.host}
                   onChange={(event) =>
                     setSmtp((current) => ({
@@ -561,10 +684,15 @@ function App() {
                     }))
                   }
                 />
+                {smtpValidationErrors.host ? (
+                  <span className="field-error">{smtpValidationErrors.host}</span>
+                ) : null}
               </label>
               <label className="field">
                 <span>端口</span>
                 <input
+                  aria-invalid={Boolean(smtpValidationErrors.port)}
+                  className={smtpValidationErrors.port ? "input-error" : undefined}
                   value={smtp.port}
                   onChange={(event) =>
                     setSmtp((current) => ({
@@ -573,10 +701,15 @@ function App() {
                     }))
                   }
                 />
+                {smtpValidationErrors.port ? (
+                  <span className="field-error">{smtpValidationErrors.port}</span>
+                ) : null}
               </label>
               <label className="field">
                 <span>用户名</span>
                 <input
+                  aria-invalid={Boolean(smtpValidationErrors.username)}
+                  className={smtpValidationErrors.username ? "input-error" : undefined}
                   value={smtp.username}
                   onChange={(event) =>
                     setSmtp((current) => ({
@@ -585,11 +718,16 @@ function App() {
                     }))
                   }
                 />
+                {smtpValidationErrors.username ? (
+                  <span className="field-error">{smtpValidationErrors.username}</span>
+                ) : null}
               </label>
               <label className="field">
                 <span>密码 / 授权码</span>
                 <input
                   type="password"
+                  aria-invalid={Boolean(smtpValidationErrors.password)}
+                  className={smtpValidationErrors.password ? "input-error" : undefined}
                   value={smtp.password}
                   onChange={(event) =>
                     setSmtp((current) => ({
@@ -598,10 +736,15 @@ function App() {
                     }))
                   }
                 />
+                {smtpValidationErrors.password ? (
+                  <span className="field-error">{smtpValidationErrors.password}</span>
+                ) : null}
               </label>
               <label className="field">
                 <span>发件邮箱</span>
                 <input
+                  aria-invalid={Boolean(smtpValidationErrors.fromAddress)}
+                  className={smtpValidationErrors.fromAddress ? "input-error" : undefined}
                   value={smtp.fromAddress}
                   onChange={(event) =>
                     setSmtp((current) => ({
@@ -610,6 +753,9 @@ function App() {
                     }))
                   }
                 />
+                {smtpValidationErrors.fromAddress ? (
+                  <span className="field-error">{smtpValidationErrors.fromAddress}</span>
+                ) : null}
               </label>
               <label className="field">
                 <span>发件人名称</span>

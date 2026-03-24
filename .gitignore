@@ -4,3 +4,7 @@ src-tauri/target
 target
 .idea
 .vite
+
+# Local artifacts
+.DS_Store
+test/

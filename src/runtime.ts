@@ -10,7 +10,7 @@ import {
 
 const SETTINGS_KEY = "payslip-mailer-settings";
 
-function isTauriRuntime() {
+export function isTauriRuntime() {
   if (typeof window === "undefined") {
     return false;
   }

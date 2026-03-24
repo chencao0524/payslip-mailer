@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const DEFAULT_SUBJECT_TEMPLATE: &str = "【薪酬通知】{{月份}}月工资条 - {{人员}}";
 const DEFAULT_BODY_TEMPLATE: &str = r#"<p style="margin: 0 0 12px;">{{人员}}，您好：</p>
@@ -135,6 +135,17 @@ struct SendResult {
     values: HashMap<String, String>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SendProgressPayload {
+    processed_count: usize,
+    total_count: usize,
+    row_number: i32,
+    recipient_name: String,
+    email: String,
+    status: String,
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -179,6 +190,7 @@ fn payslip_send(app: tauri::AppHandle, request: SendRequest) -> Result<SendRespo
     }
     validate_smtp_settings(&request.smtp)?;
 
+    let total_count = request.rows.len();
     let mailer = build_mailer(&request.smtp)?;
     let from_mailbox = Mailbox::new(
         Some(normalize_or_default(
@@ -193,11 +205,11 @@ fn payslip_send(app: tauri::AppHandle, request: SendRequest) -> Result<SendRespo
             .map_err(|error| format!("发件邮箱格式不正确: {error}"))?,
     );
 
-    let mut results = Vec::with_capacity(request.rows.len());
+    let mut results = Vec::with_capacity(total_count);
     let mut success_count = 0usize;
 
-    for row in request.rows {
-        match send_one_mail(
+    for (index, row) in request.rows.into_iter().enumerate() {
+        let send_result = match send_one_mail(
             &mailer,
             &from_mailbox,
             &request.subject_template,
@@ -206,26 +218,29 @@ fn payslip_send(app: tauri::AppHandle, request: SendRequest) -> Result<SendRespo
         ) {
             Ok(()) => {
                 success_count += 1;
-                results.push(SendResult {
+                SendResult {
                     row_number: row.row_number,
                     recipient_name: row.recipient_name,
                     email: row.email,
                     status: "SUCCESS".into(),
                     message: "发送成功".into(),
                     values: row.values,
-                });
+                }
             }
             Err(message) => {
-                results.push(SendResult {
+                SendResult {
                     row_number: row.row_number,
                     recipient_name: row.recipient_name,
                     email: row.email,
                     status: "FAILED".into(),
                     message,
                     values: row.values,
-                });
+                }
             }
-        }
+        };
+
+        emit_send_progress(&app, &send_result, index + 1, total_count)?;
+        results.push(send_result);
     }
 
     append_history(
@@ -244,6 +259,26 @@ fn payslip_send(app: tauri::AppHandle, request: SendRequest) -> Result<SendRespo
         failure_count: results.len() - success_count,
         results,
     })
+}
+
+fn emit_send_progress(
+    app: &tauri::AppHandle,
+    result: &SendResult,
+    processed_count: usize,
+    total_count: usize,
+) -> Result<(), String> {
+    app.emit(
+        "payslip-send-progress",
+        SendProgressPayload {
+            processed_count,
+            total_count,
+            row_number: result.row_number,
+            recipient_name: result.recipient_name.clone(),
+            email: result.email.clone(),
+            status: result.status.clone(),
+        },
+    )
+    .map_err(|error| format!("无法发送进度事件: {error}"))
 }
 
 fn send_one_mail(
