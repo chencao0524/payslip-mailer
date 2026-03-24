@@ -365,6 +365,14 @@ fn render_template(
 
 fn merged_values(values: &HashMap<String, String>) -> HashMap<String, String> {
     let mut merged = values.clone();
+
+    for (key, value) in values {
+        let compact_key = compact_key(key);
+        if compact_key != *key {
+            merged.entry(compact_key).or_insert_with(|| value.clone());
+        }
+    }
+
     merged
         .entry("姓名".into())
         .or_insert_with(|| value_of(values, "人员"));
@@ -375,6 +383,10 @@ fn merged_values(values: &HashMap<String, String>) -> HashMap<String, String> {
         .entry("净发工资".into())
         .or_insert_with(|| value_of(values, "实发工资"));
     merged
+}
+
+fn compact_key(value: &str) -> String {
+    normalize_text(value).replace(' ', "")
 }
 
 fn value_of(values: &HashMap<String, String>, key: &str) -> String {
