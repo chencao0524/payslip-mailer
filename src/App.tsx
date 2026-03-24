@@ -108,6 +108,8 @@ function App() {
   const [sendProgressCurrentLabel, setSendProgressCurrentLabel] = useState<
     string | null
   >(null);
+  const [sendProgressSuccessCount, setSendProgressSuccessCount] = useState(0);
+  const [sendProgressFailureCount, setSendProgressFailureCount] = useState(0);
 
   useEffect(() => {
     let active = true;
@@ -148,6 +150,12 @@ function App() {
       const payload = event.payload;
       setSendProgressCount(payload.processedCount);
       setSendProgressTotal(payload.totalCount);
+      setSendProgressSuccessCount((current) =>
+        payload.status === "SUCCESS" ? current + 1 : current,
+      );
+      setSendProgressFailureCount((current) =>
+        payload.status === "FAILED" ? current + 1 : current,
+      );
       setSendProgressCurrentLabel(
         `${payload.recipientName || payload.email || `第 ${payload.rowNumber} 行`} ${payload.status === "SUCCESS" ? "已发送" : "发送失败"}`,
       );
@@ -165,13 +173,19 @@ function App() {
       return null;
     }
     if (isSending) {
-      return `正在发送 ${sendProgressCount} / ${sendProgressTotal}`;
+      return `正在发送 ${sendProgressCount} / ${sendProgressTotal}，成功 ${sendProgressSuccessCount}，失败 ${sendProgressFailureCount}`;
     }
     if (sendProgressCount >= sendProgressTotal) {
-      return `发送完成 ${sendProgressCount} / ${sendProgressTotal}`;
+      return `发送完成 ${sendProgressCount} / ${sendProgressTotal}，成功 ${sendProgressSuccessCount}，失败 ${sendProgressFailureCount}`;
     }
-    return `发送中断 ${sendProgressCount} / ${sendProgressTotal}`;
-  }, [isSending, sendProgressCount, sendProgressTotal]);
+    return `发送中断 ${sendProgressCount} / ${sendProgressTotal}，成功 ${sendProgressSuccessCount}，失败 ${sendProgressFailureCount}`;
+  }, [
+    isSending,
+    sendProgressCount,
+    sendProgressFailureCount,
+    sendProgressSuccessCount,
+    sendProgressTotal,
+  ]);
 
   const sendProgressPercent = useMemo(() => {
     if (sendProgressTotal === 0) {
@@ -246,6 +260,8 @@ function App() {
     setSendProgressCount(0);
     setSendProgressTotal(0);
     setSendProgressCurrentLabel(null);
+    setSendProgressSuccessCount(0);
+    setSendProgressFailureCount(0);
     setIsPreviewing(true);
     try {
       const result = await parsePayslipFile(targetFile);
@@ -294,6 +310,8 @@ function App() {
     setSendProgressCount(0);
     setSendProgressTotal(readyRows.length);
     setSendProgressCurrentLabel("正在准备发送");
+    setSendProgressSuccessCount(0);
+    setSendProgressFailureCount(0);
     try {
       await waitForNextPaint();
       const request: SendRequest = {
@@ -305,6 +323,8 @@ function App() {
       const result = await sendPayslips(request);
       setSendProgressCount(result.totalCount);
       setSendProgressTotal(result.totalCount);
+      setSendProgressSuccessCount(result.successCount);
+      setSendProgressFailureCount(result.failureCount);
       setSendProgressCurrentLabel(
         result.failureCount > 0 ? "发送完成，部分记录失败" : "发送完成",
       );
@@ -369,6 +389,8 @@ function App() {
     setSendProgressCount(0);
     setSendProgressTotal(0);
     setSendProgressCurrentLabel(null);
+    setSendProgressSuccessCount(0);
+    setSendProgressFailureCount(0);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
