@@ -14,6 +14,16 @@ This repository contains the desktop-only 工资条发送器 tool. It can be run
 
 > If `npm install` hangs because the sandbox cannot reach the public registry, download the dependencies elsewhere or mirror them into `node_modules` so the dev server can start.
 
+## 校验规则
+- 所有工资条校验都在“预览与发送”阶段完成；只要命中任一风险项，就会整批禁止发送。
+- 只有同时具备 `人员`、`月份`，且至少包含 `实发工资` 或 `工资总额` 的行，才会被识别为工资明细；其他行会被跳过。
+- 邮箱不能为空，且必须满足基础邮箱格式校验；不合法的记录会被标记为无效。
+- 同一批工资条中如果出现重复邮箱，相关记录会被标记为无效，并阻止整批发送。
+- 发送前必须先导入“人员-邮箱对应关系”表；未导入时，不允许发送。
+- 工资条里的每一条 `姓名-邮箱` 配对都必须完整存在于“人员-邮箱对应关系”表中；只要任意一条配对不存在，就会阻止整批发送。
+- 更新“人员-邮箱对应关系”表后，当前工资条预览、发送结果和进度会被完整清空，必须重新导入工资条再校验。
+- SMTP 发送前端校验会检查 `SMTP 主机`、`端口`、`发件邮箱`；如果启用了认证，还会强制检查 `用户名` 和 `密码/授权码`。端口必须是 `1-65535` 的整数。
+
 ## Packaging for macOS and Windows
 - `npm run build` -> Tauri build. By default it already targets `dmg` and `msi`. Specify `TAURI_BUNDLE_TARGET` if you need additional CPU architectures (`x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, etc.).
 - Tauri was chosen over Electron because it ships a much smaller binary, reuses the system WebView, includes Rust-based API access, and has first-class support for macOS & Windows bundles. Electron can be added later if a Chromium runtime is explicitly required, but Tauri keeps the tooling lightweight for this focused use case.
@@ -56,5 +66,4 @@ This repository contains the desktop-only 工资条发送器 tool. It can be run
 <img width="283" height="222" alt="图片" src="https://github.com/user-attachments/assets/d743c3a5-a642-4b83-8640-5ff40c77cb57" />
 
 模版：[工资条模版.xlsx](https://github.com/user-attachments/files/26165805/default.xlsx)
-
 

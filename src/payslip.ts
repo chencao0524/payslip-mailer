@@ -484,8 +484,11 @@ function markMappingMismatches(
     return [];
   }
 
-  const mappingByName = new Map(
-    contactMappings.map((entry) => [normalizePersonName(entry.recipientName), normalizeEmail(entry.email)]),
+  const mappingPairs = new Set(
+    contactMappings.map(
+      (entry) =>
+        `${normalizePersonName(entry.recipientName)}\u0000${normalizeEmail(entry.email)}`,
+    ),
   );
   const mismatches: string[] = [];
 
@@ -496,22 +499,13 @@ function markMappingMismatches(
 
     const recipientName = normalizePersonName(row.recipientName);
     const email = normalizeEmail(row.email);
-    const expectedEmail = mappingByName.get(recipientName);
+    const pairKey = `${recipientName}\u0000${email}`;
 
-    if (!expectedEmail) {
+    if (!mappingPairs.has(pairKey)) {
       row.status = "INVALID";
-      row.message = "姓名未出现在对应关系表中，已禁止发送";
+      row.message = "姓名与邮箱配对未出现在对应关系表中，已禁止发送";
       mismatches.push(
-        `${row.recipientName || `第 ${row.rowNumber} 行`}：姓名未出现在对应关系表中`,
-      );
-      return;
-    }
-
-    if (expectedEmail !== email) {
-      row.status = "INVALID";
-      row.message = "姓名与邮箱对应关系不匹配，已禁止发送";
-      mismatches.push(
-        `${row.recipientName || `第 ${row.rowNumber} 行`}：工资表是 ${row.email || "-"}，对应关系表是 ${expectedEmail}`,
+        `${row.recipientName || `第 ${row.rowNumber} 行`}：${row.email || "-"} 未出现在对应关系表配对中`,
       );
     }
   });
