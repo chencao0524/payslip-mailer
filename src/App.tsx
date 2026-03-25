@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   buildDefaultBodyTemplate,
+  type ContactMappingStore,
   DEFAULT_SMTP,
   DEFAULT_SUBJECT_TEMPLATE,
   exportFailedRows,
   type PayslipSettings,
+  parseContactMappingFile,
   parsePayslipFile,
   type PreviewResponse,
   type SendRequest,
@@ -13,8 +16,12 @@ import {
   type SmtpSettings,
 } from "./payslip";
 import {
+  clearContactMapping,
   isTauriRuntime,
+  loadContactMapping,
   loadSettings,
+  readLocalFile,
+  saveContactMapping,
   saveSettings,
   sendPayslips,
 } from "./runtime";
@@ -55,7 +62,11 @@ function validateSmtpSettings(smtp: SmtpSettings): SmtpValidationErrors {
     errors.port = "请输入端口";
   } else {
     const portNumber = Number(port);
-    if (!Number.isInteger(portNumber) || portNumber <= 0 || portNumber > 65535) {
+    if (
+      !Number.isInteger(portNumber) ||
+      portNumber <= 0 ||
+      portNumber > 65535
+    ) {
       errors.port = "端口必须是 1 到 65535 的整数";
     }
   }
@@ -81,9 +92,28 @@ function waitForNextPaint() {
   });
 }
 
+function isSingleFileDrag(event: DragEvent<HTMLElement>) {
+  return Array.from(event.dataTransfer.types).includes("Files");
+}
+
+function isPointInside(element: HTMLElement | null, x: number, y: number) {
+  if (!element) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const contactMappingInputRef = useRef<HTMLInputElement | null>(null);
+  const payslipDropzoneRef = useRef<HTMLDivElement | null>(null);
+  const contactMappingDropzoneRef = useRef<HTMLDivElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [contactMapping, setContactMapping] =
+    useState<ContactMappingStore | null>(null);
+  const [showContactMappingDetails, setShowContactMappingDetails] =
+    useState(false);
   const [defaultSubjectTemplate, setDefaultSubjectTemplate] = useState(
     DEFAULT_SUBJECT_TEMPLATE,
   );
@@ -99,10 +129,17 @@ function App() {
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [sendResult, setSendResult] = useState<SendResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [contactMappingError, setContactMappingError] = useState<string | null>(
+    null,
+  );
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isSavingContactMapping, setIsSavingContactMapping] = useState(false);
+  const [isPayslipDragActive, setIsPayslipDragActive] = useState(false);
+  const [isContactMappingDragActive, setIsContactMappingDragActive] =
+    useState(false);
   const [sendProgressCount, setSendProgressCount] = useState(0);
   const [sendProgressTotal, setSendProgressTotal] = useState(0);
   const [sendProgressCurrentLabel, setSendProgressCurrentLabel] = useState<
@@ -133,6 +170,14 @@ function App() {
           auth: settings.smtp.auth,
           starttls: settings.smtp.starttls,
         });
+      })
+      .catch(() => undefined);
+    loadContactMapping()
+      .then((mapping) => {
+        if (!active) {
+          return;
+        }
+        setContactMapping(mapping);
       })
       .catch(() => undefined);
     return () => {
@@ -168,6 +213,75 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onDragDropEvent(async (event) => {
+        const payload = event.payload;
+
+        if (payload.type === "leave") {
+          setIsPayslipDragActive(false);
+          setIsContactMappingDragActive(false);
+          return;
+        }
+
+        if (payload.type === "over" || payload.type === "enter") {
+          const target = detectDropTarget(
+            payload.position.x,
+            payload.position.y,
+          );
+          setIsPayslipDragActive(target === "payslip");
+          setIsContactMappingDragActive(target === "contactMapping");
+          return;
+        }
+
+        if (payload.type === "drop") {
+          const target = detectDropTarget(
+            payload.position.x,
+            payload.position.y,
+          );
+          setIsPayslipDragActive(false);
+          setIsContactMappingDragActive(false);
+
+          const path = payload.paths[0];
+          if (!path || !target) {
+            return;
+          }
+
+          try {
+            const localFile = await readLocalFile(path);
+            const nextFile = new File(
+              [new Uint8Array(localFile.bytes)],
+              localFile.fileName,
+            );
+            if (target === "payslip") {
+              setFile(nextFile);
+              await handlePreview(nextFile);
+              return;
+            }
+            await handleImportContactMapping(nextFile);
+          } catch (invokeError) {
+            setError(
+              invokeError instanceof Error
+                ? invokeError.message
+                : "读取拖拽文件失败",
+            );
+          }
+        }
+      })
+      .then((dispose) => {
+        unlisten = dispose;
+      });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [contactMapping]);
+
   const sendProgressLabel = useMemo(() => {
     if (sendProgressTotal === 0) {
       return null;
@@ -194,7 +308,10 @@ function App() {
     if (sendProgressTotal > 0) {
       return Math.max(
         6,
-        Math.min(100, Math.round((sendProgressCount / sendProgressTotal) * 100)),
+        Math.min(
+          100,
+          Math.round((sendProgressCount / sendProgressTotal) * 100),
+        ),
       );
     }
     return isSending ? 8 : 0;
@@ -214,7 +331,13 @@ function App() {
   );
 
   const hasDuplicateEmails = (preview?.duplicateEmailMessages.length ?? 0) > 0;
-  const smtpValidationErrors = useMemo(() => validateSmtpSettings(smtp), [smtp]);
+  const hasMappingMismatches =
+    (preview?.mappingMismatchMessages.length ?? 0) > 0;
+  const hasContactMapping = (contactMapping?.entries.length ?? 0) > 0;
+  const smtpValidationErrors = useMemo(
+    () => validateSmtpSettings(smtp),
+    [smtp],
+  );
 
   const failedRows = useMemo(() => {
     const invalidPreviewRows =
@@ -255,6 +378,7 @@ function App() {
       return;
     }
     setError(null);
+    setContactMappingError(null);
     setSettingsMessage(null);
     setSendResult(null);
     setSendProgressCount(0);
@@ -264,7 +388,10 @@ function App() {
     setSendProgressFailureCount(0);
     setIsPreviewing(true);
     try {
-      const result = await parsePayslipFile(targetFile);
+      const result = await parsePayslipFile(
+        targetFile,
+        contactMapping?.entries ?? [],
+      );
       setPreview(result);
       if (
         subjectTemplate === DEFAULT_SUBJECT_TEMPLATE &&
@@ -288,7 +415,143 @@ function App() {
     }
   }
 
+  function handlePayslipDragOver(event: DragEvent<HTMLElement>) {
+    if (!isSingleFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    setIsPayslipDragActive(true);
+  }
+
+  function handlePayslipDragLeave(event: DragEvent<HTMLElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsPayslipDragActive(false);
+    }
+  }
+
+  function handlePayslipDrop(event: DragEvent<HTMLElement>) {
+    if (!isSingleFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    setIsPayslipDragActive(false);
+    const nextFile = event.dataTransfer.files?.[0] ?? null;
+    setFile(nextFile);
+    void handlePreview(nextFile);
+  }
+
+  async function handleImportContactMapping(file: File | null) {
+    if (!file) {
+      return;
+    }
+    setIsSavingContactMapping(true);
+    setError(null);
+    setContactMappingError(null);
+    setSettingsMessage(null);
+    try {
+      const mapping = await parseContactMappingFile(file);
+      await saveContactMapping(mapping);
+      setContactMapping(mapping);
+      setShowContactMappingDetails(false);
+      setFile(null);
+      setPreview(null);
+      setSendResult(null);
+      setSendProgressCount(0);
+      setSendProgressTotal(0);
+      setSendProgressCurrentLabel(null);
+      setSendProgressSuccessCount(0);
+      setSendProgressFailureCount(0);
+      setIsPayslipDragActive(false);
+      setSettingsMessage(
+        `对应关系表已导入，共 ${mapping.entries.length} 条记录。请重新导入工资条后再预览发送。`,
+      );
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      if (contactMappingInputRef.current) {
+        contactMappingInputRef.current.value = "";
+      }
+    } catch (invokeError) {
+      setContactMappingError(
+        invokeError instanceof Error
+          ? invokeError.message
+          : "导入对应关系表失败",
+      );
+    } finally {
+      setIsSavingContactMapping(false);
+      if (contactMappingInputRef.current) {
+        contactMappingInputRef.current.value = "";
+      }
+    }
+  }
+
+  function handleContactMappingDragOver(event: DragEvent<HTMLElement>) {
+    if (!isSingleFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    setIsContactMappingDragActive(true);
+  }
+
+  function handleContactMappingDragLeave(event: DragEvent<HTMLElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsContactMappingDragActive(false);
+    }
+  }
+
+  function handleContactMappingDrop(event: DragEvent<HTMLElement>) {
+    if (!isSingleFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    setIsContactMappingDragActive(false);
+    const nextFile = event.dataTransfer.files?.[0] ?? null;
+    void handleImportContactMapping(nextFile);
+  }
+
+  function detectDropTarget(physicalX: number, physicalY: number) {
+    const scale = window.devicePixelRatio || 1;
+    const x = physicalX / scale;
+    const y = physicalY / scale;
+
+    if (isPointInside(payslipDropzoneRef.current, x, y)) {
+      return "payslip" as const;
+    }
+    if (isPointInside(contactMappingDropzoneRef.current, x, y)) {
+      return "contactMapping" as const;
+    }
+    return null;
+  }
+
+  async function handleClearContactMapping() {
+    setError(null);
+    setContactMappingError(null);
+    setSettingsMessage(null);
+    try {
+      await clearContactMapping();
+      setContactMapping(null);
+      setShowContactMappingDetails(false);
+      setPreview(null);
+      setSettingsMessage("对应关系表已清空，请重新导入后再发送。");
+    } catch (invokeError) {
+      setError(
+        invokeError instanceof Error
+          ? invokeError.message
+          : "清空对应关系表失败",
+      );
+    } finally {
+      if (contactMappingInputRef.current) {
+        contactMappingInputRef.current.value = "";
+      }
+    }
+  }
+
   async function handleSend() {
+    if (!hasContactMapping) {
+      setError("请先导入人员-邮箱的对应关系表");
+      return;
+    }
+
     if (readyRows.length === 0) {
       setError("当前没有可发送的工资条记录");
       return;
@@ -450,26 +713,67 @@ function App() {
           </div>
         </div>
         <div className="panel-body">
-          <label className="field field-wide">
+          {contactMapping ? (
+            <p className="helper-text">
+              已加载人员-邮箱对应关系：{contactMapping.fileName}，共{" "}
+              {contactMapping.entries.length} 条记录。
+            </p>
+          ) : (
+            <p className="helper-text">
+              尚未加载人员-邮箱对应关系，当前禁止发送。
+            </p>
+          )}
+
+          <div className="field field-wide">
             <span>工资条文件</span>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              onChange={(event) => {
-                const nextFile = event.target.files?.[0] ?? null;
-                setFile(nextFile);
-                void handlePreview(nextFile);
+            <div
+              ref={payslipDropzoneRef}
+              className={`file-dropzone${isPayslipDragActive ? " is-dragging" : ""}`}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={handlePayslipDragOver}
+              onDragLeave={handlePayslipDragLeave}
+              onDrop={handlePayslipDrop}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  fileInputRef.current?.click();
+                }
               }}
-            />
-          </label>
+            >
+              <span className="file-dropzone-title">
+                点击或拖拽文件到此处上传
+              </span>
+              <span className="file-picker-name">
+                {file?.name ?? "支持 .xlsx / .xls / .csv"}
+              </span>
+              <input
+                ref={fileInputRef}
+                className="file-picker-input"
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={(event) => {
+                  const nextFile = event.target.files?.[0] ?? null;
+                  setFile(nextFile);
+                  void handlePreview(nextFile);
+                }}
+              />
+            </div>
+          </div>
 
           <div className="action-row">
             <button
               className="primary-button"
               type="button"
               onClick={handleSend}
-              disabled={isSending || readyRows.length === 0 || hasDuplicateEmails}
+              disabled={
+                isSending ||
+                readyRows.length === 0 ||
+                hasDuplicateEmails ||
+                hasMappingMismatches ||
+                !hasContactMapping
+              }
             >
               {isSending ? "发送中..." : `发送 ${readyRows.length} 条`}
             </button>
@@ -500,11 +804,12 @@ function App() {
               <div className="progress-track">
                 <div
                   className="progress-fill"
-                    style={{ width: `${sendProgressPercent}%` }}
-                  />
-                </div>
-                <p className="helper-text">
-                {sendProgressCurrentLabel ?? "真实 SMTP 发送会逐条反馈处理进度。"}
+                  style={{ width: `${sendProgressPercent}%` }}
+                />
+              </div>
+              <p className="helper-text">
+                {sendProgressCurrentLabel ??
+                  "真实 SMTP 发送会逐条反馈处理进度。"}
               </p>
             </div>
           ) : null}
@@ -517,6 +822,25 @@ function App() {
               </p>
               <ul className="duplicate-list">
                 {preview?.duplicateEmailMessages.map((message) => (
+                  <li key={message}>{message}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {!hasContactMapping ? (
+            <div className="duplicate-alert" role="alert">
+              <p className="feedback error-text">
+                尚未导入“人员-邮箱对应关系表”，已禁止发送。请先导入后再预览工资条。
+              </p>
+            </div>
+          ) : null}
+          {hasMappingMismatches ? (
+            <div className="duplicate-alert" role="alert">
+              <p className="feedback error-text">
+                检测到姓名与邮箱对应关系不匹配，已禁止本次发送：
+              </p>
+              <ul className="duplicate-list">
+                {preview?.mappingMismatchMessages.map((message) => (
                   <li key={message}>{message}</li>
                 ))}
               </ul>
@@ -639,208 +963,351 @@ function App() {
       ) : null}
 
       <section className="workspace-grid">
-        <article className="panel-card">
-          <div className="panel-title">
-            <div>
-              <h2>邮件模板</h2>
+        <div className="workspace-column">
+          <article className="panel-card">
+            <div className="panel-title">
+              <div>
+                <h2>邮件模板</h2>
+              </div>
             </div>
-          </div>
-          <div className="panel-body">
-            <label className="field">
-              <span>邮件主题模板</span>
-              <input
-                value={subjectTemplate}
-                onChange={(event) => setSubjectTemplate(event.target.value)}
-              />
-            </label>
-            <label className="field">
-              <span>邮件正文模板</span>
-              <textarea
-                rows={12}
-                value={bodyTemplate}
-                onChange={(event) => setBodyTemplate(event.target.value)}
-              />
-            </label>
-            <p className="helper-text">
-              可直接使用表头变量，例如 `{"{{人员}}"}`、`{"{{月份}}"}`、`
-              {"{{实发工资}}"}`、`{"{{邮箱}}"}`。
-            </p>
-            <div className="action-row">
-              <button
-                className="ghost-button"
-                type="button"
-                onClick={handleRestoreDefaults}
-              >
-                恢复默认
-              </button>
-              <button
-                className="ghost-button"
-                type="button"
-                disabled={isSavingSettings}
-                onClick={handleSyncCurrentAsDefault}
-              >
-                {isSavingSettings ? "保存中..." : "设为默认"}
-              </button>
+            <div className="panel-body">
+              <label className="field">
+                <span>邮件主题模板</span>
+                <input
+                  value={subjectTemplate}
+                  onChange={(event) => setSubjectTemplate(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>邮件正文模板</span>
+                <textarea
+                  rows={12}
+                  value={bodyTemplate}
+                  onChange={(event) => setBodyTemplate(event.target.value)}
+                />
+              </label>
+              <p className="helper-text">
+                可直接使用表头变量，例如 `{"{{人员}}"}`、`{"{{月份}}"}`、`
+                {"{{实发工资}}"}`、`{"{{邮箱}}"}`。
+              </p>
+              <div className="action-row">
+                <button
+                  className="ghost-button"
+                  type="button"
+                  onClick={handleRestoreDefaults}
+                >
+                  恢复默认
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={isSavingSettings}
+                  onClick={handleSyncCurrentAsDefault}
+                >
+                  {isSavingSettings ? "保存中..." : "设为默认"}
+                </button>
+              </div>
             </div>
-          </div>
-        </article>
+          </article>
 
-        <article className="panel-card">
-          <div className="panel-title">
-            <div>
-              <h2>SMTP 配置</h2>
+          <article className="panel-card">
+            <div className="panel-title">
+              <div>
+                <h2>SMTP 配置</h2>
+              </div>
             </div>
-          </div>
-          <div className="panel-body">
-            <div className="form-grid">
-              <label className="field">
-                <span>SMTP 主机</span>
-                <input
-                  aria-invalid={Boolean(smtpValidationErrors.host)}
-                  className={smtpValidationErrors.host ? "input-error" : undefined}
-                  value={smtp.host}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      host: event.target.value,
-                    }))
-                  }
-                />
-                {smtpValidationErrors.host ? (
-                  <span className="field-error">{smtpValidationErrors.host}</span>
-                ) : null}
-              </label>
-              <label className="field">
-                <span>端口</span>
-                <input
-                  aria-invalid={Boolean(smtpValidationErrors.port)}
-                  className={smtpValidationErrors.port ? "input-error" : undefined}
-                  value={smtp.port}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      port: event.target.value,
-                    }))
-                  }
-                />
-                {smtpValidationErrors.port ? (
-                  <span className="field-error">{smtpValidationErrors.port}</span>
-                ) : null}
-              </label>
-              <label className="field">
-                <span>用户名</span>
-                <input
-                  aria-invalid={Boolean(smtpValidationErrors.username)}
-                  className={smtpValidationErrors.username ? "input-error" : undefined}
-                  value={smtp.username}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      username: event.target.value,
-                    }))
-                  }
-                />
-                {smtpValidationErrors.username ? (
-                  <span className="field-error">{smtpValidationErrors.username}</span>
-                ) : null}
-              </label>
-              <label className="field">
-                <span>密码 / 授权码</span>
-                <input
-                  type="password"
-                  aria-invalid={Boolean(smtpValidationErrors.password)}
-                  className={smtpValidationErrors.password ? "input-error" : undefined}
-                  value={smtp.password}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      password: event.target.value,
-                    }))
-                  }
-                />
-                {smtpValidationErrors.password ? (
-                  <span className="field-error">{smtpValidationErrors.password}</span>
-                ) : null}
-              </label>
-              <label className="field">
-                <span>发件邮箱</span>
-                <input
-                  aria-invalid={Boolean(smtpValidationErrors.fromAddress)}
-                  className={smtpValidationErrors.fromAddress ? "input-error" : undefined}
-                  value={smtp.fromAddress}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      fromAddress: event.target.value,
-                    }))
-                  }
-                />
-                {smtpValidationErrors.fromAddress ? (
-                  <span className="field-error">{smtpValidationErrors.fromAddress}</span>
-                ) : null}
-              </label>
-              <label className="field">
-                <span>发件人名称</span>
-                <input
-                  value={smtp.fromName}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      fromName: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-            </div>
+            <div className="panel-body">
+              <div className="form-grid">
+                <label className="field">
+                  <span>SMTP 主机</span>
+                  <input
+                    aria-invalid={Boolean(smtpValidationErrors.host)}
+                    className={
+                      smtpValidationErrors.host ? "input-error" : undefined
+                    }
+                    value={smtp.host}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        host: event.target.value,
+                      }))
+                    }
+                  />
+                  {smtpValidationErrors.host ? (
+                    <span className="field-error">
+                      {smtpValidationErrors.host}
+                    </span>
+                  ) : null}
+                </label>
+                <label className="field">
+                  <span>端口</span>
+                  <input
+                    aria-invalid={Boolean(smtpValidationErrors.port)}
+                    className={
+                      smtpValidationErrors.port ? "input-error" : undefined
+                    }
+                    value={smtp.port}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        port: event.target.value,
+                      }))
+                    }
+                  />
+                  {smtpValidationErrors.port ? (
+                    <span className="field-error">
+                      {smtpValidationErrors.port}
+                    </span>
+                  ) : null}
+                </label>
+                <label className="field">
+                  <span>用户名</span>
+                  <input
+                    aria-invalid={Boolean(smtpValidationErrors.username)}
+                    className={
+                      smtpValidationErrors.username ? "input-error" : undefined
+                    }
+                    value={smtp.username}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        username: event.target.value,
+                      }))
+                    }
+                  />
+                  {smtpValidationErrors.username ? (
+                    <span className="field-error">
+                      {smtpValidationErrors.username}
+                    </span>
+                  ) : null}
+                </label>
+                <label className="field">
+                  <span>密码 / 授权码</span>
+                  <input
+                    type="password"
+                    aria-invalid={Boolean(smtpValidationErrors.password)}
+                    className={
+                      smtpValidationErrors.password ? "input-error" : undefined
+                    }
+                    value={smtp.password}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        password: event.target.value,
+                      }))
+                    }
+                  />
+                  {smtpValidationErrors.password ? (
+                    <span className="field-error">
+                      {smtpValidationErrors.password}
+                    </span>
+                  ) : null}
+                </label>
+                <label className="field">
+                  <span>发件邮箱</span>
+                  <input
+                    aria-invalid={Boolean(smtpValidationErrors.fromAddress)}
+                    className={
+                      smtpValidationErrors.fromAddress
+                        ? "input-error"
+                        : undefined
+                    }
+                    value={smtp.fromAddress}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        fromAddress: event.target.value,
+                      }))
+                    }
+                  />
+                  {smtpValidationErrors.fromAddress ? (
+                    <span className="field-error">
+                      {smtpValidationErrors.fromAddress}
+                    </span>
+                  ) : null}
+                </label>
+                <label className="field">
+                  <span>发件人名称</span>
+                  <input
+                    value={smtp.fromName}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        fromName: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+              </div>
 
-            <div className="toggle-row">
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={smtp.auth}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      auth: event.target.checked,
-                    }))
-                  }
-                />
-                <span>启用 SMTP 认证</span>
-              </label>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={smtp.starttls}
-                  onChange={(event) =>
-                    setSmtp((current) => ({
-                      ...current,
-                      starttls: event.target.checked,
-                    }))
-                  }
-                />
-                <span>启用 STARTTLS</span>
-              </label>
-            </div>
+              <div className="toggle-row">
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={smtp.auth}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        auth: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>启用 SMTP 认证</span>
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={smtp.starttls}
+                    onChange={(event) =>
+                      setSmtp((current) => ({
+                        ...current,
+                        starttls: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>启用 STARTTLS</span>
+                </label>
+              </div>
 
-            <div className="action-row">
-              <button
-                className="ghost-button"
-                type="button"
-                onClick={handleRestoreDefaultSmtp}
-              >
-                恢复默认
-              </button>
-              <button
-                className="ghost-button"
-                type="button"
-                disabled={isSavingSettings}
-                onClick={handleSyncCurrentSmtpAsDefault}
-              >
-                {isSavingSettings ? "保存中..." : "设为默认"}
-              </button>
+              <div className="action-row">
+                <button
+                  className="ghost-button"
+                  type="button"
+                  onClick={handleRestoreDefaultSmtp}
+                >
+                  恢复默认
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={isSavingSettings}
+                  onClick={handleSyncCurrentSmtpAsDefault}
+                >
+                  {isSavingSettings ? "保存中..." : "设为默认"}
+                </button>
+              </div>
             </div>
-          </div>
-        </article>
+          </article>
+        </div>
+
+        <div className="workspace-column">
+          <article className="panel-card">
+            <div className="panel-title">
+              <div>
+                <h2>人员-邮箱对应关系</h2>
+              </div>
+            </div>
+            <div className="panel-body">
+              <div className="field field-wide">
+                <span>人员-邮箱对应关系表</span>
+                <div
+                  ref={contactMappingDropzoneRef}
+                  className={`file-dropzone${isContactMappingDragActive ? " is-dragging" : ""}`}
+                  onClick={() => contactMappingInputRef.current?.click()}
+                  onDragOver={handleContactMappingDragOver}
+                  onDragLeave={handleContactMappingDragLeave}
+                  onDrop={handleContactMappingDrop}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      contactMappingInputRef.current?.click();
+                    }
+                  }}
+                >
+                  <span className="file-dropzone-title">
+                    点击或拖拽文件到此处上传
+                  </span>
+                  <span className="file-picker-name">
+                    {contactMapping?.fileName ?? "支持 .xlsx / .xls / .csv"}
+                  </span>
+                  <input
+                    ref={contactMappingInputRef}
+                    className="file-picker-input"
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    onChange={(event) => {
+                      const nextFile = event.target.files?.[0] ?? null;
+                      void handleImportContactMapping(nextFile);
+                    }}
+                  />
+                </div>
+              </div>
+              {contactMapping ? (
+                <div className="summary-grid">
+                  <div className="summary-pill">
+                    “人员-邮箱对应关系表”：{contactMapping.fileName}
+                  </div>
+                  <div className="summary-pill">
+                    记录数：{contactMapping.entries.length}
+                  </div>
+                  <div className="summary-pill">
+                    更新时间：
+                    {new Date(contactMapping.updatedAt).toLocaleString()}
+                  </div>
+                </div>
+              ) : (
+                <p className="helper-text">
+                  发送前请先导入“人员-邮箱对应关系表”，后续每次工资表预览都会逐条核对。
+                </p>
+              )}
+              {contactMappingError ? (
+                <p className="feedback error-text">{contactMappingError}</p>
+              ) : null}
+              <div className="action-row">
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={isSavingContactMapping}
+                  onClick={() => contactMappingInputRef.current?.click()}
+                >
+                  {isSavingContactMapping ? "导入中..." : "导入/更新对应关系表"}
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={!contactMapping}
+                  onClick={() =>
+                    setShowContactMappingDetails((current) => !current)
+                  }
+                >
+                  {showContactMappingDetails
+                    ? "收起当前对应关系"
+                    : "查看当前对应关系"}
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={!contactMapping}
+                  onClick={() => void handleClearContactMapping()}
+                >
+                  清空对应关系表
+                </button>
+              </div>
+              {showContactMappingDetails && contactMapping ? (
+                <div className="table-shell">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>姓名</th>
+                        <th>邮箱</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {contactMapping.entries.map((entry) => (
+                        <tr key={`${entry.recipientName}-${entry.email}`}>
+                          <td>{entry.recipientName}</td>
+                          <td>{entry.email}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+            </div>
+          </article>
+        </div>
       </section>
     </main>
   );

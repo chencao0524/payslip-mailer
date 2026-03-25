@@ -15,7 +15,8 @@
         "title": "工资条发送器",
         "width": 980,
         "height": 720,
-        "resizable": true
+        "resizable": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {

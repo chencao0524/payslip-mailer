@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   buildDefaultBodyTemplate,
+  type ContactMappingStore,
   DEFAULT_SMTP,
   DEFAULT_SUBJECT_TEMPLATE,
   type PayslipSettings,
@@ -9,6 +10,7 @@ import {
 } from "./payslip";
 
 const SETTINGS_KEY = "payslip-mailer-settings";
+const CONTACT_MAPPING_KEY = "payslip-mailer-contact-mapping";
 
 export function isTauriRuntime() {
   if (typeof window === "undefined") {
@@ -46,6 +48,44 @@ export async function saveSettings(settings: PayslipSettings) {
   }
   window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   return settings;
+}
+
+export async function loadContactMapping() {
+  if (isTauriRuntime()) {
+    return invoke<ContactMappingStore | null>("payslip_get_contact_mapping");
+  }
+  const raw = window.localStorage.getItem(CONTACT_MAPPING_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw) as ContactMappingStore;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveContactMapping(mapping: ContactMappingStore) {
+  if (isTauriRuntime()) {
+    return invoke<ContactMappingStore>("payslip_save_contact_mapping", {
+      mapping,
+    });
+  }
+  window.localStorage.setItem(CONTACT_MAPPING_KEY, JSON.stringify(mapping));
+  return mapping;
+}
+
+export async function clearContactMapping() {
+  if (isTauriRuntime()) {
+    return invoke<void>("payslip_clear_contact_mapping");
+  }
+  window.localStorage.removeItem(CONTACT_MAPPING_KEY);
+}
+
+export async function readLocalFile(path: string) {
+  return invoke<{ fileName: string; bytes: number[] }>("payslip_read_local_file", {
+    path,
+  });
 }
 
 export async function sendPayslips(request: SendRequest) {

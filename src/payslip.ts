@@ -23,8 +23,20 @@ export type PreviewResponse = {
   invalidCount: number;
   skippedCount: number;
   duplicateEmailMessages: string[];
+  mappingMismatchMessages: string[];
   defaultSubjectTemplate: string;
   defaultBodyTemplate: string;
+};
+
+export type ContactMappingEntry = {
+  recipientName: string;
+  email: string;
+};
+
+export type ContactMappingStore = {
+  fileName: string;
+  updatedAt: string;
+  entries: ContactMappingEntry[];
 };
 
 export type SendResult = {
@@ -74,6 +86,7 @@ export type PayslipSettings = {
 
 const EMAIL_HEADER = "邮箱";
 const NAME_HEADER = "人员";
+const ALT_NAME_HEADER = "姓名";
 const MONTH_HEADER = "月份";
 const NET_PAY_HEADER = "实发工资";
 const GROSS_PAY_HEADER = "工资总额";
@@ -166,18 +179,98 @@ ${rows}
 `.trim();
 }
 
-export async function parsePayslipFile(file: File): Promise<PreviewResponse> {
+export async function parsePayslipFile(
+  file: File,
+  contactMappings: ContactMappingEntry[] = [],
+): Promise<PreviewResponse> {
   const lowerName = file.name.toLowerCase();
   if (lowerName.endsWith(".csv")) {
-    return parseCsvFile(file);
+    return parseCsvFile(file, contactMappings);
   }
   if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) {
-    return parseWorkbookFile(file);
+    return parseWorkbookFile(file, contactMappings);
   }
   throw new Error("仅支持 xlsx、xls 或 csv 文件");
 }
 
-function parseWorkbookFile(file: File): Promise<PreviewResponse> {
+export async function parseContactMappingFile(
+  file: File,
+): Promise<ContactMappingStore> {
+  const lowerName = file.name.toLowerCase();
+  const rows = lowerName.endsWith(".csv")
+    ? await loadCsvRows(file)
+    : lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")
+      ? await loadWorkbookRows(file)
+      : null;
+
+  if (!rows) {
+    throw new Error("对应关系表仅支持 xlsx、xls 或 csv 文件");
+  }
+
+  const headerRowIndex = locateContactMappingHeaderRow(rows);
+  if (headerRowIndex < 0) {
+    throw new Error("未识别到对应关系表表头，请确认包含“人员/姓名、邮箱”列");
+  }
+
+  const headers = (rows[headerRowIndex] ?? []).map((value) =>
+    normalizeText(String(value ?? "")),
+  );
+  const nameColumnIndex = findHeaderIndex(headers, [NAME_HEADER, ALT_NAME_HEADER]);
+  const emailColumnIndex = findHeaderIndex(headers, [EMAIL_HEADER]);
+
+  if (nameColumnIndex < 0 || emailColumnIndex < 0) {
+    throw new Error("对应关系表缺少“人员/姓名”或“邮箱”列");
+  }
+
+  const entries = new Map<string, ContactMappingEntry>();
+  const emails = new Map<string, string>();
+
+  for (let rowIndex = headerRowIndex + 1; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex] ?? [];
+    const recipientName = normalizePersonName(String(row[nameColumnIndex] ?? ""));
+    const email = normalizeEmail(String(row[emailColumnIndex] ?? ""));
+
+    if (!recipientName && !email) {
+      continue;
+    }
+    if (!recipientName || !email) {
+      throw new Error(`对应关系表第 ${rowIndex + 1} 行缺少姓名或邮箱`);
+    }
+    if (!EMAIL_PATTERN.test(email)) {
+      throw new Error(`对应关系表第 ${rowIndex + 1} 行邮箱格式不正确：${email}`);
+    }
+
+    const existing = entries.get(recipientName);
+    if (existing && existing.email !== email) {
+      throw new Error(
+        `对应关系表中“${recipientName}”存在多个邮箱：${existing.email} / ${email}`,
+      );
+    }
+
+    const existingName = emails.get(email);
+    if (existingName && existingName !== recipientName) {
+      throw new Error(
+        `对应关系表中邮箱“${email}”同时对应多个姓名：${existingName} / ${recipientName}`,
+      );
+    }
+
+    entries.set(recipientName, { recipientName, email });
+    emails.set(email, recipientName);
+  }
+
+  return {
+    fileName: file.name,
+    updatedAt: new Date().toISOString(),
+    entries: Array.from(entries.values()).sort((left, right) =>
+      left.recipientName.localeCompare(right.recipientName, "zh-CN"),
+    ),
+  };
+}
+
+function parseWorkbookFile(
+  file: File,
+  contactMappings: ContactMappingEntry[],
+): Promise<PreviewResponse> {
   return file.arrayBuffer().then((buffer) => {
     const workbook = XLSX.read(buffer, { type: "array", raw: false, cellText: false, cellDates: false });
     const sheetName = workbook.SheetNames.includes("员工工资条") ? "员工工资条" : workbook.SheetNames[0];
@@ -197,31 +290,29 @@ function parseWorkbookFile(file: File): Promise<PreviewResponse> {
       throw new Error("未识别到工资条表头，请确认包含“人员、月份、邮箱”等列");
     }
 
-    return buildPreviewResponse(file.name, sheetName, rows, headerRowIndex);
+    return buildPreviewResponse(file.name, sheetName, rows, headerRowIndex, contactMappings);
   });
 }
 
-async function parseCsvFile(file: File): Promise<PreviewResponse> {
-  const content = await file.text();
-  const workbook = XLSX.read(content, { type: "string", raw: false });
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) {
-    throw new Error("CSV 文件为空");
-  }
-  const rows = XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(workbook.Sheets[sheetName], {
-    header: 1,
-    raw: false,
-    defval: "",
-    blankrows: false,
-  });
+async function parseCsvFile(
+  file: File,
+  contactMappings: ContactMappingEntry[],
+): Promise<PreviewResponse> {
+  const rows = await loadCsvRows(file);
   const headerRowIndex = locateHeaderRow(rows);
   if (headerRowIndex < 0) {
     throw new Error("未识别到工资条表头，请确认包含“人员、月份、邮箱”等列");
   }
-  return buildPreviewResponse(file.name, "CSV", rows, headerRowIndex);
+  return buildPreviewResponse(file.name, "CSV", rows, headerRowIndex, contactMappings);
 }
 
-function buildPreviewResponse(fileName: string, sheetName: string, rawRows: (string | number | boolean | null)[][], headerRowIndex: number) {
+function buildPreviewResponse(
+  fileName: string,
+  sheetName: string,
+  rawRows: (string | number | boolean | null)[][],
+  headerRowIndex: number,
+  contactMappings: ContactMappingEntry[],
+) {
   const headers = trimTrailingBlankHeaders(
     (rawRows[headerRowIndex] ?? []).map((value) => normalizeText(String(value ?? ""))),
   );
@@ -250,6 +341,7 @@ function buildPreviewResponse(fileName: string, sheetName: string, rawRows: (str
   }
 
   const duplicateEmailMessages = markDuplicateEmails(rows);
+  const mappingMismatchMessages = markMappingMismatches(rows, contactMappings);
 
   const readyCount = rows.filter((row) => row.status === "READY").length;
   const invalidCount = rows.filter((row) => row.status === "INVALID").length;
@@ -265,6 +357,7 @@ function buildPreviewResponse(fileName: string, sheetName: string, rawRows: (str
     invalidCount,
     skippedCount,
     duplicateEmailMessages,
+    mappingMismatchMessages,
     defaultSubjectTemplate: DEFAULT_SUBJECT_TEMPLATE,
     defaultBodyTemplate: buildDefaultBodyTemplate(),
   } satisfies PreviewResponse;
@@ -297,6 +390,24 @@ function scoreHeaderRow(values: string[]) {
     score += 6;
   }
   return score;
+}
+
+function locateContactMappingHeaderRow(rows: (string | number | boolean | null)[][]) {
+  const limit = Math.min(rows.length, 12);
+  for (let index = 0; index < limit; index += 1) {
+    const headers = (rows[index] ?? []).map((value) => normalizeText(String(value ?? "")));
+    if (
+      findHeaderIndex(headers, [NAME_HEADER, ALT_NAME_HEADER]) >= 0 &&
+      findHeaderIndex(headers, [EMAIL_HEADER]) >= 0
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findHeaderIndex(headers: string[], candidates: string[]) {
+  return headers.findIndex((header) => candidates.includes(header));
 }
 
 function trimTrailingBlankHeaders(headers: string[]) {
@@ -365,12 +476,100 @@ function markDuplicateEmails(rows: PreviewRow[]) {
   });
 }
 
+function markMappingMismatches(
+  rows: PreviewRow[],
+  contactMappings: ContactMappingEntry[],
+) {
+  if (contactMappings.length === 0) {
+    return [];
+  }
+
+  const mappingByName = new Map(
+    contactMappings.map((entry) => [normalizePersonName(entry.recipientName), normalizeEmail(entry.email)]),
+  );
+  const mismatches: string[] = [];
+
+  rows.forEach((row) => {
+    if (row.status === "SKIPPED") {
+      return;
+    }
+
+    const recipientName = normalizePersonName(row.recipientName);
+    const email = normalizeEmail(row.email);
+    const expectedEmail = mappingByName.get(recipientName);
+
+    if (!expectedEmail) {
+      row.status = "INVALID";
+      row.message = "姓名未出现在对应关系表中，已禁止发送";
+      mismatches.push(
+        `${row.recipientName || `第 ${row.rowNumber} 行`}：姓名未出现在对应关系表中`,
+      );
+      return;
+    }
+
+    if (expectedEmail !== email) {
+      row.status = "INVALID";
+      row.message = "姓名与邮箱对应关系不匹配，已禁止发送";
+      mismatches.push(
+        `${row.recipientName || `第 ${row.rowNumber} 行`}：工资表是 ${row.email || "-"}，对应关系表是 ${expectedEmail}`,
+      );
+    }
+  });
+
+  return mismatches;
+}
+
 function valueOf(values: Record<string, string>, key: string) {
   return normalizeText(values[key] ?? "");
 }
 
+function normalizePersonName(value: string) {
+  return normalizeText(value);
+}
+
 function normalizeEmail(value: string) {
   return normalizeText(value).toLowerCase();
+}
+
+async function loadWorkbookRows(file: File) {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, {
+    type: "array",
+    raw: false,
+    cellText: false,
+    cellDates: false,
+  });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) {
+    throw new Error("文件为空");
+  }
+  return XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(
+    workbook.Sheets[sheetName],
+    {
+      header: 1,
+      raw: false,
+      defval: "",
+      blankrows: false,
+    },
+  );
+}
+
+async function loadCsvRows(file: File) {
+  const content = await file.text();
+  const workbook = XLSX.read(content, { type: "string", raw: false });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) {
+    throw new Error("CSV 文件为空");
+  }
+  return XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(
+    workbook.Sheets[sheetName],
+    {
+      header: 1,
+      raw: false,
+      defval: "",
+      blankrows: false,
+    },
+  );
 }
 
 function normalizeText(value: string) {

@@ -101,10 +101,20 @@ textarea {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 18px;
+  align-items: start;
+}
+
+.workspace-column {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
 }
 
 .panel-card {
+  width: 100%;
   padding: 18px;
+  align-self: start;
 }
 
 .panel-title {
@@ -136,6 +146,47 @@ textarea {
 
 .field-wide {
   grid-column: 1 / -1;
+}
+
+.file-picker-name {
+  color: #526076;
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-picker-input {
+  display: none;
+}
+
+.file-dropzone {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: center;
+  min-height: 88px;
+  padding: 12px 14px;
+  border: 1px dashed rgba(66, 86, 112, 0.24);
+  border-radius: 13px;
+  background: rgba(249, 251, 253, 0.95);
+  cursor: pointer;
+  transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+}
+
+.file-dropzone:hover,
+.file-dropzone:focus-visible,
+.file-dropzone.is-dragging {
+  outline: none;
+  border-color: rgba(185, 105, 16, 0.48);
+  box-shadow: 0 0 0 3px rgba(185, 105, 16, 0.08);
+  background: rgba(255, 250, 244, 0.98);
+}
+
+.file-dropzone-title {
+  color: #182130;
+  font-size: 0.84rem;
+  font-weight: 600;
 }
 
 .field input,
@@ -183,6 +234,16 @@ textarea {
   border-radius: 15px;
   border: 1px solid rgba(170, 90, 15, 0.16);
   background: rgba(255, 247, 236, 0.92);
+}
+
+.mapping-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(24, 50, 75, 0.1);
+  background: rgba(245, 249, 255, 0.88);
 }
 
 .progress-copy {
@@ -373,6 +434,7 @@ tbody tr:hover {
   .workspace-grid {
     grid-template-columns: 1fr;
   }
+
 }
 
 @media (max-width: 720px) {

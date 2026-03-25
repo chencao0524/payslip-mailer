@@ -86,6 +86,21 @@ struct PayslipSettings {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct ContactMappingStore {
+    file_name: String,
+    updated_at: String,
+    entries: Vec<ContactMappingEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ContactMappingEntry {
+    recipient_name: String,
+    email: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SmtpSettings {
     host: String,
     port: String,
@@ -146,11 +161,22 @@ struct SendProgressPayload {
     status: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalFilePayload {
+    file_name: String,
+    bytes: Vec<u8>,
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             payslip_get_settings,
             payslip_save_settings,
+            payslip_get_contact_mapping,
+            payslip_save_contact_mapping,
+            payslip_clear_contact_mapping,
+            payslip_read_local_file,
             payslip_send
         ])
         .run(tauri::generate_context!())
@@ -181,6 +207,54 @@ fn payslip_save_settings(
         .map_err(|error| format!("工资条配置序列化失败: {error}"))?;
     fs::write(path, content).map_err(|error| format!("工资条配置保存失败: {error}"))?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn payslip_get_contact_mapping(
+    app: tauri::AppHandle,
+) -> Result<Option<ContactMappingStore>, String> {
+    let path = contact_mapping_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("对应关系表读取失败: {error}"))?;
+    let mapping: ContactMappingStore = serde_json::from_str(&content)
+        .map_err(|error| format!("对应关系表读取失败: {error}"))?;
+    Ok(Some(mapping))
+}
+
+#[tauri::command]
+fn payslip_save_contact_mapping(
+    app: tauri::AppHandle,
+    mapping: ContactMappingStore,
+) -> Result<ContactMappingStore, String> {
+    let path = contact_mapping_path(&app)?;
+    let content = serde_json::to_string_pretty(&mapping)
+        .map_err(|error| format!("对应关系表序列化失败: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("对应关系表保存失败: {error}"))?;
+    Ok(mapping)
+}
+
+#[tauri::command]
+fn payslip_clear_contact_mapping(app: tauri::AppHandle) -> Result<(), String> {
+    let path = contact_mapping_path(&app)?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| format!("对应关系表清除失败: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn payslip_read_local_file(path: String) -> Result<LocalFilePayload, String> {
+    let path_buf = PathBuf::from(&path);
+    let file_name = path_buf
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .ok_or_else(|| "无法识别文件名".to_string())?;
+    let bytes = fs::read(&path_buf).map_err(|error| format!("读取本地文件失败: {error}"))?;
+    Ok(LocalFilePayload { file_name, bytes })
 }
 
 #[tauri::command]
@@ -461,6 +535,17 @@ fn history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     dir.push("payslip-mailer");
     fs::create_dir_all(&dir).map_err(|error| format!("无法创建配置目录: {error}"))?;
     dir.push("history.log");
+    Ok(dir)
+}
+
+fn contact_mapping_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法获取配置目录: {error}"))?;
+    dir.push("payslip-mailer");
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建配置目录: {error}"))?;
+    dir.push("contact-mapping.json");
     Ok(dir)
 }
 
